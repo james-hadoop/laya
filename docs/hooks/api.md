@@ -4,12 +4,13 @@ Everything on this page is importable from `laya` (the common names) or `laya.ho
 whole surface).
 
 ```python
-from laya import PredictContext, PredictHook, Hook
+from laya import PredictContext, PredictHook, Hook, OptionStabilityHook
 from laya.hooks import HOOK_EVENTS, normalise_hooks, dispatch, aggregate_usage
 ```
 
 - [PredictContext](#predictcontext)
 - [Hook protocol](#hook-protocol)
+- [OptionStabilityHook](#optionstabilityhook)
 - [Convenience types](#convenience-types)
 - [Configuration surface](#configuration-surface)
 - [Event payloads](#event-payloads)
@@ -18,8 +19,10 @@ from laya.hooks import HOOK_EVENTS, normalise_hooks, dispatch, aggregate_usage
 
 ## PredictContext
 
-A `PredictContext` is created once per public call and passed to every hook of that call. It is
-**mutable**: hooks may rewrite `states`, `questions` and `results`, and `on_route` may rewrite
+A `PredictContext` is created once per public call and passed to every hook of that call.
+`Router.predict_batch` is the one exception: it creates one per request, as a `Router.predict`
+call for that request would, so its Router-level hooks fire once per request with one state
+each. It is **mutable**: hooks may rewrite `states`, `questions` and `results`, and `on_route` may rewrite
 `decision`. It uses identity equality (`eq=False`), so a context is hashable and two contexts are
 never equal.
 
@@ -44,9 +47,9 @@ class PredictContext:
 
 | field | type | set when | mutable | meaning |
 |---|---|---|---|---|
-| `states` | `list` | always | yes (start) | the states for this call. `system_one`/`Router.predict` pass one; `predict_batch` passes many. A start hook may replace the list. |
+| `states` | `list` | always | yes (start) | the states for this call. `system_one`/`Router.predict` pass one; `Agent.predict_batch` passes many; `Router.predict_batch` passes one per request. A start hook may replace the list. |
 | `questions` | `dict` | always | yes (start) | the questions. A start hook may replace the dict. |
-| `run_id` | `str` | always | no | a unique id shared by every hook of this call. Use it to correlate events and spans. |
+| `run_id` | `str` | always | no | a unique id shared by the predict events of this call (`on_predict_start`, `on_predict_end`, `on_error`). `on_route`, `on_load` and `on_evict` are dispatched with contexts of their own, so their `run_id` differs even within one `Router.predict`. Use it to correlate events and spans. |
 | `results` | `list \| None` | end (and on a skip) | yes (end) | per-state result dicts, each shaped like `system_one`'s return. `None` until inference finishes. |
 | `decision` | `dict \| None` | Router only | yes (route) | the `RouteDecision` (a `dict`) that selected the checkpoint. |
 | `model` | `str \| None` | always | no | the checkpoint id: `Agent.model_id` for an Agent, the resolved alias (for example `"english"`) for a Router. |
@@ -56,7 +59,7 @@ class PredictContext:
 | `head_max_len` | `int \| None` | always | yes (start) | per-call token budget for the question head. `None` uses the agent config. |
 | `usage` | `dict \| None` | end | yes (end) | `{"input_tokens", "output_tokens"}`, summed over the states of the call. |
 | `started_at` | `float` | always | no | `time.perf_counter()` when the call began. |
-| `elapsed_ms` | `float \| None` | end | no | wall time for the whole call, milliseconds. |
+| `elapsed_ms` | `float \| None` | end | no | wall time in milliseconds, measured from `started_at`. On an Agent that is the whole call. On a Router `started_at` is reset after routing and loading, so it is the prediction only -- a cold model load is not in it. |
 | `error` | `BaseException \| None` | failure path | no | the exception, set before `on_error` and `on_predict_end`. |
 
 ### `PredictContext.skip(results)`
@@ -64,12 +67,36 @@ class PredictContext:
 Short-circuits inference. Called from `on_predict_start`, it sets `ctx.results` so the forward
 pass is skipped; `on_predict_end` still runs and the supplied results are returned.
 
+The key has to cover everything the answer depends on, and the hook has to cover everything the
+call carries: hooks fire once per call, and `predict_batch` calls them with every state at once.
+
 ```python
+import hashlib, json
+
+CACHE = {}
+
+def key(ctx, index):
+    # Not sort_keys=True: criteria order is positional, so two orders are two questions,
+    # and the checkpoint and token budget change the answer too.
+    payload = json.dumps([ctx.states[index], ctx.questions, ctx.model,
+                          ctx.max_len, ctx.head_max_len], default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
 def cache_read(ctx):
-    hit = CACHE.get(key(ctx.states[0], ctx.questions))
-    if hit is not None:
-        ctx.skip([hit])   # list of per-state results, same shape as predict_batch's return
+    hits = [CACHE.get(key(ctx, i)) for i in range(len(ctx.states))]
+    if all(hit is not None for hit in hits):
+        ctx.skip(hits)   # one entry per state, same shape as predict_batch's return
+
+def cache_write(ctx):
+    for i, result in enumerate(ctx.results or []):
+        CACHE[key(ctx, i)] = result
+
+laya.load("convaiinnovations/laya", on_predict_start=cache_read, on_predict_end=cache_write)
 ```
+
+`tests/test_hooks_api.py` execs this block, `examples/hooks/cache.py`, and the caching blocks of
+`docs/hooks/patterns.md` and `docs/hooks/examples.md`, and asserts all four keys the same way, so a
+page cannot teach a key the example has moved on from.
 
 On the `Router`, a skipped payload gets a `routing` key added (without overwriting one it
 already has), so `Router.predict` keeps its documented return shape.
@@ -117,6 +144,51 @@ class Audit(BaseHook):
 `Hook` is best when you want structural typing (any object with the right methods); `BaseHook` is
 best when you want an explicit base to subclass and call `super()` on.
 
+## OptionStabilityHook
+
+`OptionStabilityHook` evaluates prediction reliability across meaning-preserving option permutations and letter renamings (addressing issue #635). It executes variants in the same single-forward-pass batch without multiple network calls or serial invocations.
+
+Layout-aware (#635, #951): on checkpoints using parallel option layouts (`option_layout="parallel"`), options cannot attend to each other so reordering cannot move decisions by construction. The hook automatically detects layout from the agent config, executing rename-only probes on parallel checkpoints while running both rename and reorder probes on sequential checkpoints.
+
+```python
+from laya import OptionStabilityHook
+
+# Required accept and escalate thresholds; pass None to disable categorical triage:
+stability_hook = OptionStabilityHook(accept=0.85, escalate=0.60, variants="fast")
+agent = laya.load("convaiinnovations/laya", hooks=[stability_hook])
+```
+
+Thresholds `accept` and `escalate` are required keyword arguments: categorical gating decisions (`ACCEPT`, `VERIFY`, `ESCALATE`) depend directly on application error tolerance, option count, and temperature calibration (Issue #1245). Pass `accept=None, escalate=None` to evaluate continuous stability signals without applying categorical gating.
+
+
+It attaches a `reliability` diagnostic block to each choice question's answer:
+- `probes`: List of probe kinds that executed (e.g. `["rename"]`, `["reorder", "rename"]`, or `[]`).
+- `option_layout`: Checkpoint layout (`"parallel"` or `"sequential"`).
+- `soft_stability`: Mean probability assigned to the chosen option across all evaluated variants (`None` if unprobed).
+- `stability`: Fraction of variants whose argmax choice agrees with the original decision (`None` if unprobed).
+- `rename_stability`: Stability across rename variants (`None` if no rename probe ran).
+- `reorder_stability`: Stability across reorder variants (`None` if no reorder probe ran).
+- `decision`: Categorical classification (`ACCEPT`, `VERIFY`, or `ESCALATE`, or `None` if unprobed).
+- `variant_choices`: Mapping of variant name to decoded choice.
+- `variant_support`: Mapping of variant name to probability mass on the primary choice.
+
+### What it costs
+
+One forward pass, not several, but a wider one: the variants are extra rows in the same batch.
+A four-option `choice` costs 3 rows under `variants="fast"` and 7 under `"full"`, against 1 with
+no hook. On a GPU or MPS those extra rows are largely absorbed by the batch; on a CPU they are
+not, and the cost is close to linear in rows. Measured here on one 4-option choice, CPU, median
+of 15 calls after 4 warmups:
+
+| | rows | median | against baseline |
+|---|---:|---:|---:|
+| no hook | 1 | 62.5 ms | 1.00x |
+| `variants="fast"` | 3 | 123.9 ms | 1.98x |
+| `variants="full"` | 7 | 230.5 ms | 3.69x |
+
+So on CPU this is a diagnostic to enable deliberately, per request or on a sample of traffic,
+rather than everywhere by default. Scale the row counts by option count from the table in #908.
+
 ## Convenience types
 
 ```python
@@ -141,8 +213,10 @@ with agent.hooks_installed(debug):  # installed for the block, removed on exit
 ```
 
 `add_hook` accepts the same objects as `hooks=` (not plain callables). `hooks_installed` takes
-any number of hook objects or sequences and restores the previous list on exit, including when
-the block raises.
+any number of hook objects or sequences and, on exit -- including when the block raises -- removes
+exactly what it installed: one occurrence of each hook it added, the most recent. It does not
+restore a snapshot of the list, so a hook the application had already installed stays installed,
+and a hook added inside the block with `add_hook` is left in place.
 
 ## Process-wide defaults
 
@@ -229,28 +303,54 @@ agent.system_one(state, questions,
                  hooks=None, on_predict_start=None, on_predict_end=None, hooks_raise=None,
                  hooks_timeout=None, max_len=None, head_max_len=None)
 
+agent.predict_long(state, questions, window=None, stride=None, aggregate="auto",
+                   batch_size=None, lang=None,
+                   hooks=None, on_predict_start=None, on_predict_end=None, hooks_raise=None,
+                   hooks_timeout=None)
+
 agent.predict(...)          # alias of system_one
 ```
 
 - `hooks_raise` and `hooks_timeout` on a per-call method default to `None`, meaning "use the instance value".
 - `hooks_concurrent` is instance-level only.
+- On `predict_long` the hooks wrap the inference that answers the state, which for a document
+  needing several windows is the single shared `predict_batch` over them: `on_predict_start` fires
+  once, and `ctx.states` holds the decoded window texts in scan order rather than the caller's
+  state, which was tokenized to produce them. `states` is mutable from a start hook, so the scan
+  that reaches inference need not be the split `predict_long` computed. What changes is what the
+  answer can claim:
+
+  | what the start hook did | `usage["windows"]` | `answer["window"]` |
+  |---|---|---|
+  | answered with `ctx.skip([result])` | `0` | absent -- no window scored it |
+  | left the scan as it was built | `N` | present -- `index`, `token_start`/`token_end` name the deciding span |
+  | replaced the scan, in any way | the states that were scored | absent -- the offsets describe `predict_long`'s windows, not the text that was scored |
+
+  `usage["windows"]` is total over every path, including the one where a state already fit a single
+  window, so a cached answer never reads as a window the model read.
 
 ### Router
 
 ```python
 Router(
-    models=None, device=None, token=None, max_loaded=2, default="english",
+    models=None, device=None, token=None, max_loaded=2, default="multilingual",
     auto_task_detection=False, standalone_repos=False, preload=False, lang_guess=None,
     hooks=None, on_predict_start=None, on_predict_end=None,
-    hooks_raise=True, hooks_concurrent=True,
+    hooks_raise=True, hooks_concurrent=True, hooks_timeout=None,
 )
 
 router.route(state, questions=None, model=None, task=None, lang=None, lang_guess=None,
-             hooks=None, hooks_raise=None)
+             hooks=None, hooks_raise=None, hooks_timeout=None)
 
 router.predict(state, questions, model=None, task=None, lang=None, lang_guess=None,
                hooks=None, on_predict_start=None, on_predict_end=None, hooks_raise=None,
                hooks_timeout=None, max_len=None, head_max_len=None)
+
+router.predict_batch(requests, batch_size=None, hooks_timeout=None, min_confidence=None,
+                     sort_by_length=False, hooks=None, on_predict_start=None, on_predict_end=None,
+                     hooks_raise=None, diagnostics=None)
+
+router.route_batch(requests, hooks_timeout=None, *, hooks=None, hooks_raise=None)
 
 router.system_one(...)      # alias of predict
 router.load(name)           # builds on first use; fires on_load
@@ -260,7 +360,11 @@ router.attach(name, agent)  # registers an existing agent; does not fire on_load
 router.loaded               # list of resident checkpoint names
 ```
 
-- Per-call `hooks=` on `route` and `predict` apply to the whole call, including `on_route`.
+- `route_batch` calls `route` once per request, so it dispatches `on_route` once per request with
+  the same per-call hooks. It is the one surface whose hook arguments differ in shape: `hooks` and
+  `hooks_raise` are keyword-only and there is no `on_predict_start=` / `on_predict_end=`, because
+  it never predicts.
+- Per-call `hooks=` on `route`, `route_batch`, `predict` and `predict_batch` apply to the whole call, including `on_route`. On `predict_batch` the list is composed the same way as on `predict` (installed hooks first, then the per-call list; `None` and `[]` add nothing) and runs once per request.
 - `route()` is public: calling it dispatches `on_route` with the installed hooks plus any
   per-call `hooks`.
 
@@ -269,7 +373,7 @@ router.loaded               # list of resident checkpoint names
 ```python
 ONNXAgent(model_id_or_path, onnx_path="laya.onnx", subfolder=None,
           hooks=None, on_predict_start=None, on_predict_end=None,
-          hooks_raise=True, hooks_concurrent=True)
+          hooks_raise=True, hooks_concurrent=True, hooks_timeout=None)
 
 onnx_agent.system_one(state, questions,
                       hooks=None, on_predict_start=None, on_predict_end=None, hooks_raise=None,
@@ -324,7 +428,7 @@ is for. Use `on_predict_start=` / `on_predict_end=` for those.
 These are used internally and are stable, but most users do not need them.
 
 ```python
-HOOK_EVENTS          # tuple of the six event names, in dispatch order
+HOOK_EVENTS          # tuple of the six event names; the set hooks= is validated against
 normalise_hooks(hooks=None, on_predict_start=None, on_predict_end=None) -> list
 dispatch(hooks, event, ctx, *, raise_errors=True, lock=None) -> None
 aggregate_usage(results) -> {"input_tokens": int, "output_tokens": int}
@@ -335,7 +439,10 @@ dispatch(hooks, event, ctx, *, raise_errors=True, lock=None, timeout=None)
 run_coroutine_sync(coro, loop=None)
 ```
 
-`normalise_hooks` flattens a `hooks` object/sequence and the two callables into one ordered list.
+`HOOK_EVENTS` is the set of names `normalise_hooks` and `AsyncHook` look for on a hook; its order
+is declaration order, not the order the events fire in a call -- for that see
+[Lifecycle](lifecycle.md). `normalise_hooks` flattens a `hooks` object/sequence and the two
+callables into one ordered list.
 `dispatch` calls `event` on every hook that implements it, applying the raise policy, lock and
 timeout, and runs a hook's result if it is awaitable. `run_coroutine_sync` runs an awaitable to
 completion from sync code, on the caller's loop if it is free, or on a background loop if the

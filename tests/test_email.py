@@ -22,7 +22,19 @@ The last block guards a different kind of silence. `email_questions` was defined
 in `laya/presets.py`, and `laya/__init__.py` re-exports the `presets` one. Editing the copy in
 `laya/email.py` moved `laya.email.email_questions` and left `laya.email_questions` where it was,
 with no test and no lint failing.
+
+The `edges/` block at the end is the same shape again: `clean_email_body` takes a `max_chars` budget
+and `email_state` cut every body to its default, so a request in the last paragraphs of a long email
+was deleted before the model saw it -- while the keyword a caller would use to stop that,
+`email_state(..., max_chars=8000)`, fell into `**extra` and became a field of the state instead. The
+`budget/` block above pins that repair; what it did not cover were the budget's other two arms, and
+they are the opposite of what "budget" suggests. `max_chars=0` returns an empty body, a negative one
+trims the tail, and the `max_chars * 4` pre-cut runs before the regexes, so a footer past the window
+is never seen. The first two are the answers `laya-java/fixtures/email.json` records for the ports,
+so `edges/` pins them from that oracle rather than from expectations typed here; the third is not in
+the fixture as a positive case, so it is pinned by two bodies placed on either side of `4 * max_chars`.
 """
+import inspect
 import os
 import sys
 
@@ -31,6 +43,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import laya  # noqa: E402
 from laya import email as email_module  # noqa: E402
 from laya import presets  # noqa: E402
+from laya.common import serialize_state  # noqa: E402
 from laya.email import clean_email_body, email_state  # noqa: E402
 
 PASS, FAIL = [], []
@@ -264,6 +277,122 @@ check(
     "Preciso das férias.\nDe: 10/09 a 15/09\nPode aprovar?",
 )
 
+# --------------------------------------------------------------- French mail
+# With English-only markers none of this was removed, and the quoted history below (a cancellation)
+# reached the model next to the new message (a refund request).
+FR_EMAIL = """Bonjour,
+
+J'ai été facturé deux fois sur la facture de mars. Merci de rembourser le double paiement aujourd'hui.
+
+Cordialement,
+Jean Dupont
+
+Envoyé depuis mon iPhone
+
+Ce message peut contenir des informations confidentielles. Si vous avez reçu ce message par erreur, merci de le supprimer.
+
+Le lun. 22 sept. 2026 à 10:14, Support <support@x.com> a écrit :
+> Bonjour Jean, nous avons reçu votre demande d'annulation du contrat Enterprise.
+"""
+check(
+    "fr/full reply keeps only the request",
+    clean_email_body(FR_EMAIL),
+    "Bonjour,\n\nJ'ai été facturé deux fois sur la facture de mars. "
+    "Merci de rembourser le double paiement aujourd'hui.",
+)
+for footer in [
+    "Envoyé depuis mon iPhone",
+    "Envoyé de mon iPad.",
+    "Envoyé depuis iPhone",
+    "Envoyé de iPad",
+    "ENVOYÉ DEPUIS MON IPHONE",
+]:
+    body = "Merci de rembourser la facture."
+    check("fr/device footer cut/" + footer, clean_email_body(body + "\n\n" + footer), body)
+
+for sentence in [
+    "Envoyé depuis mon iPhone par erreur.",
+    "Envoyé de mon iPad hier.",
+]:
+    body = "Bonjour,\n%s\nMerci de rembourser la facture." % sentence
+    check("fr/device sentence kept/" + sentence, clean_email_body(body), body)
+
+check(
+    "fr/outlook original-message block is cut",
+    clean_email_body(
+        "Voici le justificatif de paiement.\n\n-----Message d'origine-----\n"
+        "De : Marie <marie@acme.com>\nObjet : résilier le contrat\nNous voulons résilier le contrat."
+    ),
+    "Voici le justificatif de paiement.",
+)
+check(
+    "fr/outlook header without separator is cut",
+    clean_email_body(
+        "Voici le justificatif.\n\nDe : Marie Dupont\nEnvoyé : lundi 22 septembre 2026\n"
+        "Objet : résilier le contrat\nNous voulons résilier le contrat."
+    ),
+    "Voici le justificatif.",
+)
+check(
+    "fr/gmail attribution wrapped over two lines is cut whole",
+    clean_email_body(
+        "L'accès est rétabli, merci.\n\nLe lun. 22 sept. 2026 à 10:14, Support Technique <\n"
+        "support@acme.com> a écrit :\n> ancien texte"
+    ),
+    "L'accès est rétabli, merci.",
+)
+check(
+    "fr/short sign-off is removed",
+    clean_email_body("Bonjour,\nLa facture de mars n'est pas arrivée.\nMerci,\nJean"),
+    "Bonjour,\nLa facture de mars n'est pas arrivée.",
+)
+check(
+    "fr/`Bien à vous` sign-off is removed",
+    clean_email_body("Bonjour,\nLa facture de mars n'est pas arrivée.\nBien à vous,\nMarie"),
+    "Bonjour,\nLa facture de mars n'est pas arrivée.",
+)
+check(
+    "fr/disclaimer footer is dropped",
+    clean_email_body(
+        "J'ai besoin de la facture de mars.\n\nSi vous avez reçu ce message par erreur, supprimez-le."
+    ),
+    "J'ai besoin de la facture de mars.",
+)
+check(
+    "fr/exclusive-use footer is dropped",
+    clean_email_body(
+        "Voici le devis demandé.\n\nCe document est à l'usage exclusif du destinataire."
+    ),
+    "Voici le devis demandé.",
+)
+
+# --------------------------------------------------------------- ...without eating the request
+check(
+    "fr/request mentioning `confidentiel` is kept",
+    clean_email_body("Le contrat confidentiel doit être signé avant vendredi."),
+    "Le contrat confidentiel doit être signé avant vendredi.",
+)
+check(
+    "fr/`Merci` opening a sentence is not a signature",
+    clean_email_body("Bonjour,\nMerci pour votre aide.\nRappelez-moi."),
+    "Bonjour,\nMerci pour votre aide.\nRappelez-moi.",
+)
+check(
+    "fr/`Le ... a écrit :` without a date is body text",
+    clean_email_body("Bonjour,\nLe rapport que vous avez écrit :\nla commande 4411 n'est pas arrivée."),
+    "Bonjour,\nLe rapport que vous avez écrit :\nla commande 4411 n'est pas arrivée.",
+)
+check(
+    "fr/`exclusivement` in a request is kept",
+    clean_email_body("Le montant est destiné exclusivement au paiement de la facture. Pouvez-vous confirmer ?"),
+    "Le montant est destiné exclusivement au paiement de la facture. Pouvez-vous confirmer ?",
+)
+check(
+    "fr/`De :` without an address is body text",
+    clean_email_body("J'ai besoin de congés.\nDe : 10/09 à 15/09\nC'est possible ?"),
+    "J'ai besoin de congés.\nDe : 10/09 à 15/09\nC'est possible ?",
+)
+
 # ------------------------------------------- `From:` starts prose, not only a quote header (#338)
 # The marker used to be `^\s*From:\s.+$`, which matched any line beginning "From: ". English
 # prose opens that way ("From: my side the integration works, but please refund ..."), so the
@@ -400,9 +529,31 @@ for label, tail in [
     ("thanks in advance", "Thanks in advance,"),
     ("sincerely", "Sincerely,\nA. Meier"),
     ("sent from phone", "Sent from my iPhone"),
+    ("sent from tablet", "Sent from my iPad."),
+    ("sent from android", "Sent from my Android"),
+    ("sent from mobile", "Sent from my mobile"),
+    ("sent from iphone model", "Sent from my iPhone 15 Pro"),
+    ("sent from android phone", "Sent from my Android phone"),
+    ("sent from ipad model", "Sent from my iPad Pro"),
+    ("sent from iphone app", "Sent from my iPhone using Tapatalk"),
     ("dash delimiter", "--\nAnna Meier\nSupport"),
 ]:
     check("signoff cut/" + label, clean_email_body("%s\n\n%s" % (BODY, tail)), BODY)
+
+for suffix in ["device", "Max", "mini", "Plus"]:
+    tail = "Sent from my iPhone %s" % suffix
+    check("device footer suffix/" + suffix, clean_email_body("%s\n\n%s" % (BODY, tail)), BODY)
+
+# A device mention can describe the request rather than close the message.
+for sentence in [
+    "Sent from my iPhone by mistake.",
+    "Sent from my iPad yesterday.",
+    "Sent from my Android by mistake.",
+    "Sent from my mobile yesterday.",
+    "Sent from my iPhone using Tapatalk to report a problem.",
+]:
+    body = "Hi support,\n%s\nPlease cancel the duplicate order." % sentence
+    check("device sentence kept/" + sentence, clean_email_body(body), body)
 
 # ------------------------------------------- closings the case rule did not reach (#132 follow-up)
 # These were cut before #132 and are not now: `warmest` is not in the alternation, `and regards`
@@ -423,6 +574,63 @@ for label, tail in [
 for label, body in [
     ("and + sentence", "Hi,\n\nPlease refund 4411.\nThanks and the team will confirm it today."),
     ("warmest + sentence", "Hi,\n\nThe room is cold.\nWarmest setting still reads 18 degrees."),
+]:
+    check("signoff kept/" + label, clean_email_body(body), body)
+
+# ------------------------------------------- the name rule reaches lowercase beyond Latin-1
+# #245 replaced the ASCII `[A-Z]` with "exclude the lowercase letters", but the ranges that
+# exclude them stop at Latin-1 (`a-zß-öø-ÿ`). A word starting with ż, д or α *is* lowercase --
+# not "capitalised in any script" -- yet the class read it as a name, so the line counted as a
+# sign-off and the cut dropped whatever followed it. Case is a property of the character, not of
+# the script: the port checks it per character (`\p{Lu}\p{Lt}\p{Lo}`), and Python now checks the
+# same first-letter categories.
+for label, body in [
+    ("latin-extended lowercase name", "Hi,\n\nPlease refund invoice 4411.\nThanks, żaneta"),
+    ("cyrillic lowercase name", "Hi,\n\nPlease refund invoice 4411.\nThanks, дмитрий"),
+    ("greek lowercase name", "Hi,\n\nPlease refund invoice 4411.\nThanks, αλέξανδρος"),
+    ("a roman numeral is not a name", "Hi,\n\nPlease refund invoice 4411.\nThanks, Ⅷ"),
+]:
+    check("signoff kept/" + label, clean_email_body(body), body)
+# ...while a combining mark stays part of the letter before it: `Jose\u0301` spells `José` and
+# still cuts as a sign-off (the port's `\p{M}`).
+check(
+    "signoff cut/decomposed accented name",
+    clean_email_body("%s\n\n%s" % (BODY, "Regards, Jose\u0301")),
+    BODY,
+)
+# ...in every script, not only the Latin one. `\u0300-\u036f` is the Latin combining block
+# alone, so a name carrying a mark from any other script -- a Devanagari virama, an Arabic
+# shadda, a Hebrew point, a Thai tone mark -- failed the tail and the signature stayed in the
+# body. The port's `\p{M}` covers every mark, which is what these names need.
+for label, tail in [
+    ("devanagari", "Thanks, \u0928\u092e\u0938\u094d\u0924\u0947"),
+    ("devanagari name", "Thanks, \u0930\u0935\u093f"),
+    ("arabic", "Thanks, \u0645\u062d\u0645\u0651\u062f"),
+    ("hebrew", "Regards, \u05e9\u05c1\u05dc\u05d5\u05dd"),
+    ("thai", "Thanks, \u0e2a\u0e38\u0e0a\u0e32\u0e15\u0e34\u0e4c"),
+    ("bengali", "Thanks, \u0985\u09ae\u09bf\u09a4"),
+    ("tamil", "Thanks, \u0bb5\u0bc6\u0bb3\u0bcd\u0bb3\u0bbf"),
+]:
+    check("signoff cut/mark beyond latin-1, " + label,
+          clean_email_body("%s\n\n%s" % (BODY, tail)), BODY)
+
+# ...and a mark with no base is left where it is. Stripping one that opens the tail, or that
+# follows a space, would join the tokens around it and cut a line the port keeps: `laya-ts`
+# requires each token's first character to be `\p{Lu}\p{Lt}\p{Lo}`, which a leading mark fails.
+# ZWJ and ZWNJ are `Cf` rather than `M`, so they are untouched here and in the port alike.
+for label, body in [
+    ("mark after a space", "Hi,\n\nPlease refund invoice 4411.\nThanks, Jose \u0301Smith"),
+    ("mark opening the name", "Hi,\n\nPlease refund invoice 4411.\nThanks, \u0301Jose"),
+    ("mark standing alone", "Hi,\n\nPlease refund invoice 4411.\nThanks, \u0301 Jose"),
+    ("zwnj is not a mark", "Hi,\n\nPlease refund invoice 4411.\nThanks, \u0915\u094d\u200c\u0937"),
+]:
+    check("signoff kept/" + label, clean_email_body(body), body)
+
+# ...and dropping the marks must not turn a lowercase name into one: the letter a mark rides on
+# is what the case rule asks about, so a marked lowercase name is still not a sign-off.
+for label, body in [
+    ("greek lowercase, accented", "Hi,\n\nPlease refund invoice 4411.\nThanks, \u03b1\u0301\u03bb\u03c6\u03b1"),
+    ("latin lowercase, decomposed", "Hi,\n\nPlease refund invoice 4411.\nThanks, jose\u0301"),
 ]:
     check("signoff kept/" + label, clean_email_body(body), body)
 
@@ -498,6 +706,277 @@ check(
     "email_questions/a caller override reaches both paths",
     email_module.email_questions({"legal": "contracts"})["category"]["criteria"],
     laya.email_questions({"legal": "contracts"})["category"]["criteria"],
+)
+
+
+# --------------------------------- email_state owns the body budget (a `clean_email_body` control)
+# `clean_email_body(body, max_chars=...)` takes a budget and `email_state` called it with none, so
+# the state was always cut at 3000 characters with no lever. The one call a reader reaches for,
+# `email_state(subject, body, max_chars=8000)`, went to `**extra` instead, which merges the keyword
+# into the state that `serialize_state` renders into the model's input: the budget stayed at 3000
+# and a `"max_chars": 8000` field was added to what the checkpoint reads.
+LONG = ("The account review covers the last twelve statements and the support thread that goes with "
+        "them, including the charges that were disputed and the credits that were applied. ") * 40
+REQUEST = "Please refund the duplicate monthly charge of 49 dollars from the account ending 4417."
+LONG_BODY = LONG + "\n\n" + REQUEST
+
+check(
+    "budget/default still cuts at 3000",
+    len(email_state("Billing", LONG_BODY)["body"]),
+    3000,
+)
+check_true(
+    "budget/the default cuts away a late request",
+    REQUEST not in email_state("Billing", LONG_BODY)["body"],
+    "a 3000-character cap should not reach the closing line of a 7000-character body",
+)
+check_true(
+    "budget/raising max_chars keeps the late request",
+    REQUEST in email_state("Billing", LONG_BODY, max_chars=8000)["body"],
+    "the whole point of the lever",
+)
+check(
+    "budget/max_chars reaches clean_email_body unchanged",
+    email_state("Billing", LONG_BODY, max_chars=8000)["body"],
+    clean_email_body(LONG_BODY, max_chars=8000),
+)
+check_true(
+    "budget/max_chars is not a field of the state",
+    "max_chars" not in email_state("Billing", LONG_BODY, max_chars=8000),
+    "it belongs to the cleaning, not to what the model reads",
+)
+check(
+    "budget/clean=False passes the body whole",
+    email_state("Billing", LONG_BODY, clean=False, max_chars=100)["body"],
+    LONG_BODY,
+)
+# `max_chars` is added last, so a call that already passed four positional arguments still means
+# subject, body, sender, clean. Reading the order off the signature is what fails if it moves.
+check(
+    "budget/positional order is unchanged",
+    [p.name for p in inspect.signature(email_state).parameters.values()][:5],
+    ["subject", "body", "sender", "clean", "max_chars"],
+)
+check(
+    "budget/sender still lands under from",
+    email_state("Billing", "Short body", sender="me@example.com").get("from"),
+    "me@example.com",
+)
+# The two defaults are literals on purpose -- a signature is documentation, and `max_chars: int =
+# 3000` reads better than a constant's name -- so this is what keeps the pair from drifting.
+def budget_default(fn):
+    param = inspect.signature(fn).parameters.get("max_chars")
+    return None if param is None else param.default
+
+
+check(
+    "budget/the two defaults are the same value",
+    budget_default(email_state),
+    budget_default(clean_email_body),
+)
+check(
+    "budget/email_state cuts where clean_email_body promises",
+    email_state("Billing", LONG_BODY)["body"],
+    clean_email_body(LONG_BODY),
+)
+
+# `email_state`'s `**extra` paragraph said "any other keyword becomes a field of the state", and
+# the body underneath it reads `if v is not None` -- a keyword carrying None never becomes a field.
+# The paragraph now names the filter, and these checks tie the two halves together: the live calls
+# pin what the code really does, and the docstring checks pin the prose to it. `sender` is the same
+# shape of silence on a different rule (falsy, not None), so it is checked separately rather than
+# folded into the same claim.
+extra_paragraph = [
+    p for p in (inspect.getdoc(email_state) or "").split("\n\n") if "becomes a field" in p
+]
+check_true(
+    "state doc/exactly one paragraph describes **extra",
+    len(extra_paragraph) == 1,
+    "found %d paragraph(s) mentioning 'becomes a field'" % len(extra_paragraph),
+)
+if len(extra_paragraph) == 1:
+    # Flatten so the prose wrapping mid-sentence cannot hide a token from the match.
+    flat = " ".join(extra_paragraph[0].split())
+    check_true(
+        "state doc/the keyword rule names the None filter",
+        "None" in flat and ("dropped" in flat or "omitted" in flat),
+        "the paragraph still claims every keyword becomes a field without naming the None case: %r"
+        % flat,
+    )
+    check_true(
+        "state/doc names sender's own drop rule",
+        "from" in flat or "sender" in flat,
+        "the paragraph says nothing about how `sender` is dropped: %r" % flat,
+    )
+    check_true(
+        "state/the null claim names the serializer behind it",
+        ("null" not in flat.lower()) or ("serialize_state" in flat),
+        "the paragraph claims a null would reach the prompt without naming what renders it: %r" % flat,
+    )
+    check_true(
+        "state/doc and code agree on the filter",
+        ("is not None" in inspect.getsource(email_state)) == ("None" in flat),
+        "doc names the None filter=%s, code filters on `is not None`=%s"
+        % ("None" in flat, "is not None" in inspect.getsource(email_state)),
+    )
+
+check(
+    "state/a None-valued keyword is dropped, not added",
+    "thread_id" in email_state("Billing", "Short body", thread_id=None),
+    False,
+)
+check(
+    "state/a keyword with a value becomes a field",
+    email_state("Billing", "Short body", thread_id="t-9").get("thread_id"),
+    "t-9",
+)
+check(
+    "state/a falsy sender is dropped while None extras are",
+    "from" in email_state("Billing", "Short body", sender=""),
+    False,
+)
+check(
+    "state/the dropped keys are absent, not null",
+    sorted(email_state("Billing", "Short body", sender=None, thread_id=None)),
+    ["body", "subject"],
+)
+# The rewritten paragraph claims the drop matters because the state reaches the model as JSON, so
+# that mechanism is checked against `serialize_state` rather than left as prose: a dropped key must
+# leave no `null` in the serialized prompt, and a retained one must.
+check_true(
+    "state/the mechanism the doc names really renders JSON",
+    "json.dumps" in inspect.getsource(serialize_state),
+    "`serialize_state` no longer serializes with JSON, so the paragraph's prompt claim is stale",
+)
+check(
+    "state/a dropped key leaves no null in the serialized state",
+    "null" in serialize_state(email_state("Billing", "Short body", sender=None, thread_id=None)),
+    False,
+)
+check(
+    "state/a keyword with a value does reach the serialized state",
+    '"thread_id": "t-9"' in serialize_state(email_state("Billing", "Short body", thread_id="t-9")),
+    True,
+)
+
+
+# --------------------------------- edges/ what a budget of 0 or a negative one actually does
+# `max_chars` is used as a slice index twice -- `text[:max_chars * 4]` to bound the regex work and
+# `text[:max_chars]` to return the result -- so it is a budget in the slicing sense, not a floor.
+# That means `0` produces an empty body and a negative value trims from the END, the opposite of
+# "at most this much is kept" that the word suggests. It is specified behaviour, not a bug:
+# `laya-java/fixtures/email.json` carries `budget-zero` and four `budget-negative-*` cases as the
+# reference answers the Java and TypeScript ports are tested against, and the generator's own
+# comment says the Java port used to answer with nothing where Python answers with a tail-trimmed
+# body. Nothing in Python pinned those five answers, which is how a `ValueError` for
+# `max_chars < 1` could look like a defensive fix while deleting a three-port contract (PR #1237,
+# closed here). These checks are the guard against repeating that: they reproduce the committed
+# oracle, and they fail the moment the budget stops being a slice.
+EDGE_Q = "I cannot log in and need a password reset."
+EDGE_ASTRAL = "\U0001D400" * 20
+EDGE_X = "x" * 60
+
+# Transcribed from laya-java/fixtures/email.json, `budgets`, the cases whose max_chars <= 0.
+for edge_name, edge_body, edge_n, edge_want in [
+    ("budget-zero", EDGE_Q, 0, ""),
+    ("budget-negative-small", EDGE_Q, -5, "I cannot log in a"),
+    ("budget-negative-one", EDGE_Q, -1, "I cannot log in and need a password r"),
+    ("budget-negative-astral", EDGE_ASTRAL, -2, "\U0001D400" * 10),
+    ("budget-negative-empties", EDGE_X, -12, ""),
+]:
+    check("edges/%s reproduces the committed Java answer" % edge_name,
+          clean_email_body(edge_body, edge_n), edge_want)
+
+# The rule those five are an instance of: for a negative budget the pre-cut's length test is against
+# a negative number, so it always fires and removes `4 * |n|`, and the final slice removes `|n|` more
+# -- `5 * |n|` off the end of a body the regexes have no marker to find, and empty once that reaches
+# the length.
+for n in (-1, -2, -5, -12):
+    check("edges/n=%d trims 5 * abs(n) off a body nothing is stripped from" % n,
+          clean_email_body(EDGE_X, n), EDGE_X[:n * 4][:n])
+check("edges/60 chars and n=-12 land exactly on empty", len(EDGE_X), 5 * 12)
+
+# And 0 is an answer, not an error -- the arm a caller computing `len(x) - used` reaches by
+# accident, and the one that must keep returning a string for the ports.
+def edge_raises(fn, *args, **kwargs):
+    """(type, message) for what `fn` raises, or (None, returned) when it does not."""
+    try:
+        return None, fn(*args, **kwargs)
+    except BaseException as exc:  # noqa: BLE001 - the point is which type escaped
+        return type(exc), str(exc)
+
+
+for edge_n in (0, -1, -5):
+    kind, _ = edge_raises(clean_email_body, EDGE_Q, edge_n)
+    check("edges/max_chars=%r is not refused" % edge_n, kind, None)
+
+# `email_state` forwards the budget, so the same two arms reach the model's input: an empty body,
+# and a body whose END is what is missing. Both are the shape this file exists to guard against --
+# a request that never arrives, with no error to say so.
+check("edges/email_state forwards a zero budget to an empty body",
+      email_state("Access", EDGE_Q, max_chars=0)["body"], "")
+check("edges/email_state forwards a negative budget unchanged",
+      email_state("Access", EDGE_Q, max_chars=-1)["body"], clean_email_body(EDGE_Q, -1))
+check_true(
+    "edges/a negative budget drops the tail of the message, where the ask is",
+    email_state("Access", EDGE_Q, max_chars=-5)["body"] == "I cannot log in a"
+    and "password reset" not in email_state("Access", EDGE_Q, max_chars=-5)["body"],
+    "got %r" % email_state("Access", EDGE_Q, max_chars=-5)["body"],
+)
+check("edges/a budget larger than the body is the way to mean no limit",
+      clean_email_body(EDGE_Q, len(EDGE_Q) + 1), EDGE_Q)
+
+# The pre-cut's WIDTH is the last thing these can say, and it is not a margin the result could do
+# without: the cut runs before every regex, so the cleaning sees only the first `4 * max_chars`
+# characters. Two bodies one paragraph apart at that edge answer differently. `EDGE_DISC` begins at
+# exactly `4 * 30` here, so it is chopped away whole and its paragraph -- request included --
+# survives; move it inside the window and the disclaimer rule drops the paragraph, which is the
+# same rule that made the footer tests above delete text. Widening `4` to `8` turns the first into
+# the second; narrowing it to `2` turns the second into the first; deleting the pre-cut turns the
+# first into the second.
+EDGE_DISC = "This email is confidential and intended solely for the addressee."
+check("edges/a footer starting past 4 * max_chars is never seen",
+      clean_email_body("word " * 24 + EDGE_DISC, 30), "word word word word word word ")
+check("edges/the same footer inside 4 * max_chars takes its paragraph with it",
+      clean_email_body("word " * 8 + EDGE_DISC, 30), "")
+check_true("edges/the two bodies straddle the 4 * max_chars edge",
+           len("word " * 24) == 4 * 30 and len("word " * 8 + EDGE_DISC) < 4 * 30,
+           "got %d and %d against a window of %d; neither case tests the width any more"
+           % (len("word " * 24), len("word " * 8 + EDGE_DISC), 4 * 30))
+
+# Both docstrings now teach this, and the prose is only honest if the arithmetic it states is the
+# arithmetic the code runs. These tie the paragraph to the two slice sites and to the fixture. The
+# code is read from after the docstring, because the paragraph itself quotes both slices.
+edge_source = inspect.getsource(clean_email_body)
+edge_parts = edge_source.split('"""')
+check_true("edges/the docstring is the first triple-quoted block",
+           edge_parts[0].startswith("def clean_email_body")
+           and edge_parts[1].lstrip().startswith("Remove quoted"),
+           "the split below no longer separates prose from code")
+edge_code = edge_parts[2]
+check_true("edges/the body is sliced exactly twice",
+           edge_code.count("[:max_chars") == 2,
+           "found %d `[:max_chars` slices in the code; the docstring says twice"
+           % edge_code.count("[:max_chars"))
+check_true("edges/the pre-cut is four times the budget",
+           "max_chars * 4" in edge_code,
+           "the `4 * |max_chars|` half of the stated arithmetic is not in the code")
+for edge_fn, edge_phrase in [
+    (clean_email_body, "slice budget"),
+    (clean_email_body, "laya-java/fixtures/email.json"),
+    (clean_email_body, "5 * |max_chars|"),
+    (clean_email_body, "never recognized"),
+    (email_state, "slice budget"),
+    (email_state, "laya-java/fixtures/email.json"),
+]:
+    edge_doc = " ".join((inspect.getdoc(edge_fn) or "").split())
+    check_true("edges/doc/%s says %r" % (edge_fn.__name__, edge_phrase),
+               edge_phrase in edge_doc,
+               "the paragraph no longer states the rule the checks above pin")
+check_true(
+    "edges/doc/email_state warns against 0 and a negative by name",
+    "never `0` or a negative" in " ".join((inspect.getdoc(email_state) or "").split()),
+    "the sentence that tells a caller how to mean `no limit` has been reworded away",
 )
 
 

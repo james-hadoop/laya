@@ -43,7 +43,7 @@ function makeRouter(extra: Record<string, unknown> = {}) {
       return { model: "laya-rl-agent", answers: {}, usage: { input_tokens: 5, output_tokens: 0 } };
     },
   });
-  const router = new Router({ loader, ...extra } as never);
+  const router = new Router({ default: "english", loader, ...extra } as never);
   return { router, calls };
 }
 
@@ -111,6 +111,59 @@ describe("agent hooks", () => {
     });
     const r = (await agent.systemOne("hi", QUESTIONS)) as Record<string, unknown>;
     expect(r["stamped"]).toBe(true);
+  });
+
+  it("awaits an async end hook, so it can rewrite the results after an await", async () => {
+    const agent = makeAgent([], {
+      async onPredictEnd(ctx) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        for (const r of ctx.results ?? []) r["stamped"] = true;
+      },
+    });
+    const r = (await agent.systemOne("hi", QUESTIONS)) as Record<string, unknown>;
+    expect(r["stamped"]).toBe(true);
+  });
+
+  it("an async start hook may skip inference after an await", async () => {
+    const seen: string[] = [];
+    const cached = { model: "cache", answers: {}, usage: { input_tokens: 0, output_tokens: 0 } };
+    const agent = makeAgent(seen, {
+      async onPredictStart(ctx) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        ctx.skip([cached]);
+      },
+    });
+    expect(await agent.systemOne("hi", QUESTIONS)).toEqual(cached);
+    expect(seen).toEqual([]);
+  });
+
+  it("waits for each async hook before the next one runs", async () => {
+    const order: string[] = [];
+    const agent = makeAgent([], {
+      hooks: [{
+        async onPredictStart() {
+          order.push("first:begin");
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          order.push("first:end");
+        },
+      }],
+    });
+    await agent.systemOne("hi", QUESTIONS, { onPredictStart: () => void order.push("second") });
+    expect(order).toEqual(["first:begin", "first:end", "second"]);
+  });
+
+  it("a rejecting async hook follows hooksRaise: raised by default, a warning when false", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const failing = { async onPredictEnd() { await Promise.resolve(); throw new Error("metrics backend down"); } };
+      await expect(makeAgent([], { hooks: [failing] }).systemOne("hi", QUESTIONS)).rejects.toThrow("metrics backend down");
+      const r = await makeAgent([], { hooks: [failing], hooksRaise: false }).systemOne("hi", QUESTIONS);
+      expect(r.answers).toHaveProperty("q");
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("metrics backend down"));
+      await new Promise((resolve) => setTimeout(resolve, 10)); // an unhandled rejection would surface here
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("per-call hooks run after installed hooks", async () => {
@@ -224,6 +277,44 @@ describe("router hooks", () => {
     });
     const r = await router.predict("plain english text", QUESTIONS);
     expect(r.routing.model).toBe("english");
+  });
+
+  it("awaits async Router hooks, and a rejecting onRoute hook does not become an unhandled rejection", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const { router } = makeRouter({
+        hooksRaise: false,
+        hooks: [{
+          async onPredictEnd(ctx: PredictContext) {
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            for (const r of ctx.results ?? []) r["stamped"] = true;
+          },
+          async onRoute() { await Promise.resolve(); throw new Error("route hook down"); },
+        }],
+      });
+      const r = (await router.predict("plain english text", QUESTIONS)) as unknown as Record<string, unknown>;
+      expect(r["stamped"]).toBe(true);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("route hook down"));
+      await new Promise((resolve) => setTimeout(resolve, 10)); // an unhandled rejection would surface here
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("an async onLoad hook may call router.load for the model being loaded without deadlocking", async () => {
+    const seen: string[] = [];
+    const { router } = makeRouter({
+      hooks: [{
+        async onLoad(ctx: PredictContext) {
+          seen.push("begin");
+          await router.load(ctx.model as string);
+          seen.push("end");
+        },
+      }],
+    });
+    const timeout = new Promise((resolve) => setTimeout(() => resolve("deadlock"), 500));
+    expect(await Promise.race([router.load("english"), timeout])).not.toBe("deadlock");
+    expect(seen).toEqual(["begin", "end"]);
   });
 
   it("a cache hit still gets a routing key, without overwriting an existing one", async () => {
@@ -377,6 +468,40 @@ describe("BaseHook and process-wide default hooks (py #276 parity)", () => {
     }
   });
 
+  it("defaults/fire once per Router.predict, not again inside the Agent", async () => {
+    const events: string[] = [];
+    const tag = (ctx: PredictContext) => (ctx.router ? "router" : "agent");
+    setDefaultHooks({
+      onPredictStart: (ctx: PredictContext) => void events.push(`start:${tag(ctx)}`),
+      onPredictEnd: (ctx: PredictContext) => void events.push(`end:${tag(ctx)}`),
+    });
+    try {
+      const router = new Router();
+      router.attach("english", makeAgent() as never);
+      await router.predict("s0", QUESTIONS, { model: "english" });
+      expect(events).toEqual(["start:router", "end:router"]);
+    } finally {
+      clearDefaultHooks();
+    }
+  });
+
+  it("defaults/still fire for a direct Agent call made while a Router request is in flight", async () => {
+    const events: string[] = [];
+    setDefaultHooks({ onPredictEnd: (ctx: PredictContext) => void events.push(ctx.router ? "router" : "agent") });
+    try {
+      const router = new Router();
+      router.attach("english", makeAgent() as never);
+      await Promise.all([
+        router.predict("s0", QUESTIONS, { model: "english" }),
+        makeAgent().predict("s1", QUESTIONS),
+      ]);
+      expect(events.filter((e) => e === "router")).toHaveLength(1);
+      expect(events.filter((e) => e === "agent")).toHaveLength(1);
+    } finally {
+      clearDefaultHooks();
+    }
+  });
+
   it("defaults/cover the router lifecycle (onLoad/onEvict)", async () => {
     const events: [string, string | undefined][] = [];
     class LifeDefaults extends BaseHook {
@@ -399,6 +524,131 @@ describe("BaseHook and process-wide default hooks (py #276 parity)", () => {
       ]);
     } finally {
       clearDefaultHooks();
+    }
+  });
+});
+
+describe("hook timeout", () => {
+  class SlowHook {
+    async onPredictStart(): Promise<void> {
+      await new Promise((resolve) => setTimeout(resolve, 10_000));
+    }
+  }
+
+  /** Settle `pending` without an unhandled rejection if the call fails. */
+  function capture(pending: Promise<unknown>): Promise<unknown> {
+    return pending.then(
+      (value) => value,
+      (err: unknown) => err,
+    );
+  }
+
+  it("names the hook and the event when a hook times out", async () => {
+    vi.useFakeTimers();
+    try {
+      const pending = makeAgent([], { hooks: [new SlowHook()], hooksTimeout: 0.05 }).systemOne("hi", QUESTIONS);
+      const settled = capture(pending);
+      await vi.advanceTimersByTimeAsync(50);
+      const err = await settled;
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).name).toBe("TimeoutError");
+      expect((err as Error).message).toBe("laya: hook SlowHook.onPredictStart exceeded 0.05s");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("clears the timer when an async hook finishes before the deadline", async () => {
+    vi.useFakeTimers();
+    const armed = vi.spyOn(globalThis, "setTimeout");
+    const cleared = vi.spyOn(globalThis, "clearTimeout");
+    try {
+      class FastHook {
+        async onPredictStart(): Promise<void> {
+          await Promise.resolve();
+        }
+      }
+      const agent = makeAgent([], { hooks: [new FastHook()], hooksTimeout: 1 });
+      await agent.systemOne("hi", QUESTIONS);
+      expect(armed).toHaveBeenCalled();
+      for (const id of armed.mock.results.map((result) => result.value)) {
+        expect(cleared).toHaveBeenCalledWith(id);
+      }
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      armed.mockRestore();
+      cleared.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not start a timer for a synchronous hook", async () => {
+    vi.useFakeTimers();
+    const armed = vi.spyOn(globalThis, "setTimeout");
+    try {
+      class SyncHook {
+        onPredictStart(): void {}
+      }
+      const agent = makeAgent([], { hooks: [new SyncHook()], hooksTimeout: 0.05 });
+      await agent.systemOne("hi", QUESTIONS);
+      expect(armed).not.toHaveBeenCalled();
+    } finally {
+      armed.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("hooksRaise false reports the timeout and continues", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const pending = makeAgent([], {
+        hooks: [new SlowHook()],
+        hooksTimeout: 0.05,
+        hooksRaise: false,
+      }).systemOne("hi", QUESTIONS);
+      await vi.advanceTimersByTimeAsync(50);
+      const r = await pending;
+      expect(r.answers).toHaveProperty("q");
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("laya: hook SlowHook.onPredictStart exceeded 0.05s"),
+      );
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("a per-call hooksTimeout overrides the agent default", async () => {
+    vi.useFakeTimers();
+    try {
+      class BoundedHook {
+        async onPredictStart(): Promise<void> {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+      }
+
+      const shortCall = capture(
+        makeAgent([], { hooks: [new BoundedHook()], hooksTimeout: 5 }).systemOne("hi", QUESTIONS, {
+          hooksTimeout: 0.05,
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(50);
+      const err = await shortCall;
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).name).toBe("TimeoutError");
+      expect((err as Error).message).toBe("laya: hook BoundedHook.onPredictStart exceeded 0.05s");
+
+      const longCall = makeAgent([], { hooks: [new BoundedHook()], hooksTimeout: 0.05 }).systemOne(
+        "hi",
+        QUESTIONS,
+        { hooksTimeout: 5 },
+      );
+      await vi.advanceTimersByTimeAsync(200);
+      const r = await longCall;
+      expect(r.answers).toHaveProperty("q");
+    } finally {
+      vi.useRealTimers();
     }
   });
 });

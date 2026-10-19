@@ -1,7 +1,8 @@
 # Tracing
 
-Every hook of one call receives the same `PredictContext.run_id`, so a tracer can correlate the
-start, end and error events (and any spans it opens) without keeping its own bookkeeping.
+Every predict-event hook of one call receives the same `PredictContext.run_id`, so a tracer can
+correlate the start, end and error events (and any spans it opens) without keeping its own
+bookkeeping.
 
 - [run_id](#run_id)
 - [A minimal tracer](#a-minimal-tracer)
@@ -14,8 +15,17 @@ start, end and error events (and any spans it opens) without keeping its own boo
 ## run_id
 
 - A `uuid4().hex` string, created once per public call (`predict_batch`, `system_one`,
-  `Router.predict`, `ONNXAgent.system_one`).
-- Shared by every hook of that call, including `on_error` and `on_predict_end`.
+  `Router.predict`, `ONNXAgent.system_one`). `Router.predict_batch` creates one per request
+  instead, the `run_id` a `Router.predict` call for that request would have had.
+- Shared by every predict-event hook of that call: `on_predict_start`, `on_predict_end` and
+  `on_error` see one `PredictContext`, so one `run_id`.
+- **Not** shared with `on_route`, `on_load` or `on_evict`. Each is dispatched with a context of
+  its own, so the count one `Router.predict` hands out is the number of contexts that call makes:
+  two when the checkpoint is already resident (`on_route` plus the prediction), three when it has
+  to load one (the load adds `on_load`), and four when that load also evicts an LRU checkpoint
+  (`on_evict` adds another). Three is the cold path; a warm Router gives two per call. Correlate a
+  routing decision with its prediction through `ctx.decision`, which `on_predict_start` also
+  carries, not through `run_id`.
 - Not global and not persisted: it identifies a call within the process. Put it in your logs and
   outbound payloads to correlate across systems.
 - Distinct per call, so two calls never collide.
@@ -156,13 +166,20 @@ serving concurrently. See [patterns](patterns.md#blocking-work).
 ## Nested calls
 
 A hook that calls `predict` again starts a new call with a new `run_id`. The parent and child are
-independent unless you link them yourself. Capture the parent id and pass it along:
+independent unless you link them yourself. The child's `run_id` lives on the child's own
+`PredictContext`, not on the payload `predict` returns, so capture it with a per-call hook:
 
 ```python
 def enrich(ctx):
-    child = enricher.predict(ctx.states[0], EXTRA_QUESTIONS)
-    record_child_span(parent_run_id=ctx.run_id, child_run_id=child.get("run_id"))
+    for state in ctx.states:                     # a hook sees every state of the call
+        def link(child_ctx, parent_run_id=ctx.run_id):
+            record_child_span(parent_run_id=parent_run_id, child_run_id=child_ctx.run_id)
+
+        enricher.predict(state, EXTRA_QUESTIONS, on_predict_start=link)
 ```
+
+One parent `run_id`, one child call per state. A body that reads `ctx.states[0]` links the first
+decision of a batch and silently drops the rest.
 
 Guard against recursion (see [anti-patterns](patterns.md#recursive-predict)); the easiest guard
 is a separate `enricher` agent with no hooks.

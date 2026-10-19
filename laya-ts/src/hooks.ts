@@ -68,15 +68,15 @@ function now(): number {
 
 /** Optional lifecycle methods. Implement any subset; missing methods are skipped. */
 export interface Hook {
-  onPredictStart?(ctx: PredictContext): void;
-  onPredictEnd?(ctx: PredictContext): void;
+  onPredictStart?(ctx: PredictContext): void | Promise<void>;
+  onPredictEnd?(ctx: PredictContext): void | Promise<void>;
   onRoute?(ctx: PredictContext): void;
-  onLoad?(ctx: PredictContext): void;
-  onEvict?(ctx: PredictContext): void;
-  onError?(ctx: PredictContext): void;
+  onLoad?(ctx: PredictContext): void | Promise<void>;
+  onEvict?(ctx: PredictContext): void | Promise<void>;
+  onError?(ctx: PredictContext): void | Promise<void>;
 }
 
-export type PredictHook = (ctx: PredictContext) => void;
+export type PredictHook = (ctx: PredictContext) => void | Promise<void>;
 export type HookArg = Hook | Hook[] | null | undefined;
 export type PredictHookArg = PredictHook | PredictHook[] | null | undefined;
 
@@ -220,6 +220,18 @@ export function clearDefaultHooks(): void {
   defaultHooksList.length = 0;
 }
 
+const defaultsRan = new WeakSet<object>();
+
+/** `Router.predict` marks the options of its Agent call: the Router already ran the defaults for this request. */
+export function markDefaultsRan(opts: object): void {
+  defaultsRan.add(opts);
+}
+
+/** Whether `opts` was marked by `markDefaultsRan`, so the Agent must not run the defaults a second time. */
+export function defaultsAlreadyRan(opts: object): boolean {
+  return defaultsRan.has(opts);
+}
+
 /**
  * Effective hook list for one call: defaults, then installed, then per-call hooks.
  *
@@ -231,8 +243,18 @@ export function composeHooks(
   onPredictStart?: PredictHookArg,
   onPredictEnd?: PredictHookArg,
 ): Hook[] {
+  if (
+    defaultHooksList.length === 0 && installed.length === 0 && (hooks === null || hooks === undefined) &&
+    (onPredictStart === null || onPredictStart === undefined) &&
+    (onPredictEnd === null || onPredictEnd === undefined)
+  ) {
+    return EMPTY_HOOKS;
+  }
   return [...defaultHooksList, ...installed, ...normaliseHooks(hooks, onPredictStart, onPredictEnd)];
 }
+
+const EMPTY_HOOKS: Hook[] = [];
+Object.freeze(EMPTY_HOOKS);
 
 /**
  * Base class giving a runtime-mutable hook list.
@@ -295,29 +317,135 @@ export function aggregateUsage(results: Record<string, unknown>[]): Record<strin
   return { input_tokens: total("input_tokens"), output_tokens: total("output_tokens") };
 }
 
+function reportHookFailure(hook: Hook, event: HookEvent, err: unknown): void {
+  const name = (hook as object)?.constructor?.name ?? "hook";
+  console.warn(`laya: hook ${name}.${event} failed: ${String(err)}`);
+}
+
 /**
  * Call `event` on every hook that implements it.
  *
  * `raiseErrors=false` warns and continues, for hooks (telemetry) that must not fail a
  * request. Python also takes a `lock` to serialise dispatch for hooks that are not safe to
- * run concurrently; JS hooks run synchronously on one thread, so there is nothing to lock.
+ * run concurrently; JS hooks run on one thread, so there is nothing to lock.
+ *
+ * It does not wait for a hook that returns a promise, so it is for callers that cannot wait,
+ * such as the synchronous `Router.route`; a rejection can then only be reported as a warning.
+ * `dispatchAsync` waits and applies `raiseErrors` to it.
  */
+
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return typeof (value as PromiseLike<unknown> | null | undefined)?.then === "function";
+}
+
+function trimTrailingZeros(decimal: string): string {
+  const dot = decimal.indexOf(".");
+  if (dot < 0) return decimal;
+  let end = decimal.length;
+  while (end > 0 && decimal.charAt(end - 1) === "0") end--;
+  if (end > 0 && decimal.charAt(end - 1) === ".") end--;
+  return decimal.slice(0, end);
+}
+
+/** Seconds the way CPython prints `"%g"`: `exceeded 0.05s` and `exceeded 1s`, not `1.0s`. */
+function formatTimeoutSeconds(timeoutMs: number): string {
+  const value = timeoutMs / 1000;
+  if (!Number.isFinite(value)) return String(value);
+  const scientific = value.toExponential(5);
+  const marker = scientific.indexOf("e");
+  if (marker < 0) return scientific;
+  const exponent = Number(scientific.slice(marker + 1));
+  if (exponent < -4 || exponent >= 6) {
+    const sign = exponent < 0 ? "-" : "+";
+    return (
+      trimTrailingZeros(scientific.slice(0, marker)) +
+      `e${sign}${String(Math.abs(exponent)).padStart(2, "0")}`
+    );
+  }
+  return trimTrailingZeros(value.toFixed(5 - exponent));
+}
+
+/** JS has no `TimeoutError` class; Python raises that builtin, so the name is set to match. */
+function hookTimeoutError(operationName: string, timeoutMs: number): Error {
+  const err = new Error(`laya: hook ${operationName} exceeded ${formatTimeoutSeconds(timeoutMs)}s`);
+  err.name = "TimeoutError";
+  return err;
+}
+
+/**
+ * Await one hook result. The return value is discarded: nothing reads it.
+ *
+ * A non-thenable has already finished, so a configured timeout starts no timer. A thenable is
+ * raced against `timeoutMs`, and the timer is cleared whether the hook settles or the deadline
+ * wins. The deadline matches Python: `TimeoutError`, `laya: hook <Class.event> exceeded <N>s`.
+ */
+async function runWithTimeout(
+  result: unknown,
+  timeoutMs: number | null,
+  operationName: string,
+): Promise<void> {
+  if (timeoutMs === null || timeoutMs === undefined) {
+    await result;
+    return;
+  }
+  if (!isThenable(result)) return;
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      result,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(hookTimeoutError(operationName, timeoutMs));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 export function dispatch(
   hooks: Hook[],
   event: HookEvent,
   ctx: PredictContext,
-  opts: { raiseErrors?: boolean } = {},
+  opts: { raiseErrors?: boolean; timeoutMs?: number | null; hook?: Hook } = {},
 ): void {
   const raiseErrors = opts.raiseErrors ?? true;
   for (const hook of hooks) {
     const method = hook?.[event];
     if (typeof method !== "function") continue;
     try {
-      method.call(hook, ctx);
+      const result: unknown = method.call(hook, ctx);
+      if (isThenable(result)) {
+        Promise.resolve(result).catch((err) => reportHookFailure(hook, event, err));
+      }
     } catch (err) {
       if (raiseErrors) throw err;
-      const name = (hook as object)?.constructor?.name ?? "hook";
-      console.warn(`laya: hook ${name}.${event} failed: ${String(err)}`);
+      reportHookFailure(hook, event, err);
+    }
+  }
+}
+
+/** Like `dispatch`, but waits for each hook that returns a promise before the next runs, and a
+ *  rejection follows `raiseErrors` the way a thrown error does. */
+export async function dispatchAsync(
+  hooks: Hook[],
+  event: HookEvent,
+  ctx: PredictContext,
+  opts: { raiseErrors?: boolean; timeoutMs?: number | null; hook?: Hook } = {},
+): Promise<void> {
+  const timeoutMs = opts.timeoutMs ?? null;
+  const raiseErrors = opts.raiseErrors ?? true;
+  for (const hook of hooks) {
+    const method = hook?.[event];
+    if (typeof method !== "function") continue;
+    const operationName = `${(hook as object)?.constructor?.name ?? "hook"}.${event}`;
+    try {
+      await runWithTimeout(method.call(hook, ctx), timeoutMs, operationName);
+    } catch (err) {
+      if (raiseErrors) throw err;
+      reportHookFailure(hook, event, err);
     }
   }
 }
